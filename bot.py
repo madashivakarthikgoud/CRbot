@@ -326,8 +326,18 @@ async def help_command(update: Update, ctx: CallbackContext) -> None:
 # ─── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+
+    # Load environment
+    BOT_TOKEN        = os.environ["BOT_TOKEN"]
+    CHANNEL_ID       = int(os.environ["CHANNEL_ID"])
+    DISCUSSION_ID    = int(os.environ["DISCUSSION_ID"])
+    WEBHOOK_URL_BASE = os.environ["WEBHOOK_URL_BASE"].rstrip("/")  # e.g. https://<your-app>.onrender.com
+    PORT             = int(os.environ.get("PORT", "8443"))
+
+    # Build the bot application
     app = Application.builder().token(BOT_TOKEN).job_queue(JobQueue()).build()
 
+    # Register handlers
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -357,13 +367,18 @@ def main() -> None:
         per_chat=True,
         conversation_timeout=1800,
     )
-
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("help", help_command))
 
-    # Health check HTTP server omitted for brevity
-    app.run_polling()
+    # Start webhook instead of long polling
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_path=BOT_TOKEN,
+        webhook_url=f"{WEBHOOK_URL_BASE}/{BOT_TOKEN}",
+    )
 
 if __name__ == "__main__":
     main()
+
