@@ -349,10 +349,10 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cancel_post))
     app.run_polling()
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()
+
 # ─── Entry Point ────────────────────────────────────────────────────────────────
-import os
 import threading
 from aiohttp import web
 
@@ -366,7 +366,9 @@ def _start_http_server():
     web.run_app(app, port=port)
 
 if __name__ == "__main__":
-    # Launch your Telegram bot in a background thread
+    # Run the Telegram bot in a background thread
     threading.Thread(target=main, daemon=True).start()
-    # Then start the HTTP server on $PORT for Render health checks
+    # Start the HTTP server for Render health checks
     _start_http_server()
+
+
