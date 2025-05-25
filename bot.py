@@ -9,7 +9,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardRemove,
-    ChatMember,
 )
 from telegram.ext import (
     Application,
@@ -53,7 +52,8 @@ URL_REGEX = re.compile(r"https?://\S+")
 class PostDataManager:
     @staticmethod
     def initialize(ctx: CallbackContext):
-        # reset and set dynamic build_date
+        # clear any prior data and set dynamic build_date
+        ctx.user_data.clear()
         ctx.user_data["post_data"] = {
             "banner": None,
             "tags": [],
@@ -72,7 +72,6 @@ class PostDataManager:
 
     @staticmethod
     async def post_text_discussion(ctx: CallbackContext, heading: str, text: str) -> str:
-        # Post long text with heading to discussion
         msg = await ctx.bot.send_message(
             chat_id=DISCUSSION_ID,
             text=f"<b>{heading}</b>\n\n{text}",
@@ -83,7 +82,6 @@ class PostDataManager:
 
     @staticmethod
     async def post_photo_discussion(ctx: CallbackContext, heading: str, file_id: str) -> str:
-        # Post photo with caption heading to discussion
         msg = await ctx.bot.send_photo(
             chat_id=DISCUSSION_ID,
             photo=file_id,
@@ -132,26 +130,38 @@ class PostDataManager:
                 parts.append(f"- {line}")
             parts.append("")
         # Footer
-        parts.append("Follow: @POCOHUB_X3EN")
-        parts.append("Join: @POCOHUB_X3ChatEN")
-        parts.append("Gcam: @SuryaKarna_GcamDiscussion")
-        parts.append("TG Mirror: @suryarom")
-        parts.append(f"Updated - {d['build_date']}")
+        parts.extend([
+            "Follow: @POCOHUB_X3EN",
+            "Join: @POCOHUB_X3ChatEN",
+            "Gcam: @SuryaKarna_GcamDiscussion",
+            "TG Mirror: @suryarom",
+            f"Updated - {d['build_date']}"
+        ])
         return "\n".join(parts)
 
 # ─── Handlers ───────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: CallbackContext) -> int:
+    # Reset any existing flow
+    PostDataManager.initialize(ctx)
     member = await ctx.bot.get_chat_member(CHANNEL_ID, update.effective_user.id)
     if member.status not in ("creator", "administrator"):
         await update.message.reply_text("❌ You must be a channel admin.")
         return ConversationHandler.END
-    PostDataManager.initialize(ctx)
     await update.message.reply_text(
         "🤖 *ROM Post Bot* by *Shiva Karthik*\nGitHub: https://github.com/madashivakarthikgoud\n\n📸 Send banner image or /skip to omit:",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove()
     )
     return BANNER
+
+async def cancel_command(update: Update, ctx: CallbackContext) -> int:
+    # Cancel via command
+    ctx.user_data.clear()
+    await update.message.reply_text(
+        "❌ Operation cancelled.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return ConversationHandler.END
 
 async def handle_banner(update: Update, ctx: CallbackContext) -> int:
     if update.message.photo:
@@ -279,7 +289,7 @@ async def handle_notes(update: Update, ctx: CallbackContext) -> int:
     )
     return CONFIRM
 
-async def publish_post(update: Update, ctx: CallbackContext) -> None:
+async def publish_post(update: Update, ctx: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
     d = ctx.user_data["post_data"]
@@ -290,12 +300,14 @@ async def publish_post(update: Update, ctx: CallbackContext) -> None:
     else:
         await ctx.bot.send_message(text=caption, **send_args)
     await query.edit_message_text("✅ Successfully published!")
+    ctx.user_data.clear()
     return ConversationHandler.END
 
-async def cancel_post(update: Update, ctx: CallbackContext) -> None:
+async def cancel_post(update: Update, ctx: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("❌ Operation cancelled.")
+    ctx.user_data.clear()
     return ConversationHandler.END
 
 async def help_command(update: Update, ctx: CallbackContext) -> None:
@@ -315,11 +327,12 @@ async def help_command(update: Update, ctx: CallbackContext) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     app = Application.builder().token(BOT_TOKEN).job_queue(JobQueue()).build()
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            BANNER:       [MessageHandler(filters.PHOTO, handle_banner), CommandHandler("skip", handle_banner)],
-            TAGS:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tags)],
+            BANNER:       [MessageHandler(filters.PHOTO | filters.Command("skip"), handle_banner)],
+            TAGS:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tags), CommandHandler("skip", handle_tags)],
             TITLE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_title)],
             DEVICE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device)],
             MAINTAINER:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_maintainer)],
@@ -339,36 +352,18 @@ def main() -> None:
                 CallbackQueryHandler(cancel_post, pattern="^cancel$"),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_post)],
+        fallbacks=[CommandHandler("cancel", cancel_command)],
         per_user=True,
         per_chat=True,
         conversation_timeout=1800,
     )
+
     app.add_handler(conv)
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("cancel", cancel_post))
+
+    # Health check HTTP server omitted for brevity
     app.run_polling()
 
-# if __name__ == "__main__":
-#     main()
-
-# ─── Entry Point ────────────────────────────────────────────────────────────────
-import threading
-from aiohttp import web
-
-async def _handle_root(request):
-    return web.Response(text="OK")
-
-def _start_http_server():
-    app = web.Application()
-    app.router.add_get("/", _handle_root)
-    port = int(os.environ.get("PORT", 8000))
-    web.run_app(app, port=port)
-
 if __name__ == "__main__":
-    # Run the Telegram bot in a background thread
-    threading.Thread(target=main, daemon=True).start()
-    # Start the HTTP server for Render health checks
-    _start_http_server()
-
-
+    main()
