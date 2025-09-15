@@ -1,384 +1,331 @@
+# bot.py
 import os
 import re
+import uuid
+import shutil
 import logging
-from datetime import datetime
-from typing import List
-from dotenv import load_dotenv
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
+import tempfile
+from pathlib import Path
+from typing import Dict, List
+
+from telegram import Update, InputFile
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ConversationHandler,
-    CallbackContext,
-    CallbackQueryHandler,
-    filters,
-    JobQueue,
+    Application, CommandHandler, MessageHandler,
+    ConversationHandler, CallbackContext, filters
 )
 
-# ─── Configuration ─────────────────────────────────────────────────────────────
-load_dotenv()
-BOT_TOKEN     = os.getenv("BOT_TOKEN")
-CHANNEL_ID    = int(os.getenv("CHANNEL_ID", "0"))
-DISCUSSION_ID = int(os.getenv("DISCUSSION_ID", "0"))
-if not BOT_TOKEN or CHANNEL_ID == 0 or DISCUSSION_ID == 0:
-    raise EnvironmentError("Missing BOT_TOKEN, CHANNEL_ID, or DISCUSSION_ID")
+# image processing
+from PIL import Image, ImageOps
+from rembg import remove
 
-# ─── States ────────────────────────────────────────────────────────────────────
-(
-    BANNER,
-    TAGS,
-    TITLE,
-    DEVICE,
-    MAINTAINER,
-    SCREENSHOTS,
-    CHANGELOG,
-    DEVICE_CHANGELOG,
-    DOWNLOAD_LINKS,
-    DONATE_LINK,
-    README,
-    NOTES,
-    CONFIRM,
-) = range(13)
+# ─── Logging ──────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger("sticker-bot")
 
-URL_REGEX = re.compile(r"https?://\S+")
+# ─── States ───────────────────────────────
+(STICKER_TITLE, STICKER_IMAGES) = range(200, 202)
 
-# ─── Data Manager ───────────────────────────────────────────────────────────────
-class PostDataManager:
-    @staticmethod
-    def initialize(ctx: CallbackContext):
-        # clear any prior data and set dynamic build_date
-        ctx.user_data.clear()
-        ctx.user_data["post_data"] = {
-            "banner": None,
-            "tags": [],
-            "title": None,
-            "device": None,
-            "maintainer": None,
-            "screenshots": [],
-            "changelog": None,
-            "device_changelog": None,
-            "download_links": {},
-            "donate": None,
-            "readme": None,
-            "notes": None,
-            "build_date": datetime.now().strftime("%d/%m/%Y"),
-        }
+# ─── Helpers ──────────────────────────────
+def safe_short_name(title: str, bot_username: str) -> str:
+    # Telegram sticker set requirement: short name must be unique and contain only a-zA-Z0-9_
+    # We enforce suffix `_by_<botusername>`
+    s = re.sub(r"[^a-zA-Z0-9_]", "_", title.lower())
+    return f"{s}_by_{bot_username}"
 
-    @staticmethod
-    async def post_text_discussion(ctx: CallbackContext, heading: str, text: str) -> str:
-        msg = await ctx.bot.send_message(
-            chat_id=DISCUSSION_ID,
-            text=f"<b>{heading}</b>\n\n{text}",
-            parse_mode="HTML",
-            disable_notification=True
-        )
-        return f"https://t.me/c/{msg.chat.id}/{msg.message_id}".replace("-100", "")
+async def download_file(bot, file_id: str, dest_path: Path) -> Path:
+    """Download file by file_id to dest_path (async)."""
+    f = await bot.get_file(file_id)
+    await f.download_to_drive(custom_path=str(dest_path))
+    return dest_path
 
-    @staticmethod
-    async def post_photo_discussion(ctx: CallbackContext, heading: str, file_id: str) -> str:
-        msg = await ctx.bot.send_photo(
-            chat_id=DISCUSSION_ID,
-            photo=file_id,
-            caption=f"<b>{heading}</b>",
-            parse_mode="HTML",
-            disable_notification=True
-        )
-        return f"https://t.me/c/{msg.chat.id}/{msg.message_id}".replace("-100", "")
+def convert_raster_to_webp(input_path: Path, output_path: Path, size: int = 512):
+    """
+    - Removes background (rembg) and converts to 512x512 webp as required by Telegram static stickers.
+    - Keeps aspect ratio and pads with transparent background.
+    """
+    # open input
+    img = Image.open(input_path).convert("RGBA")
 
-    @staticmethod
-    def build_caption(ctx: CallbackContext) -> str:
-        d = ctx.user_data["post_data"]
-        parts: List[str] = []
-        # Hashtags
-        if d["tags"]:
-            parts.append(" ".join(d["tags"]))
-        # Header
-        parts.append(f"<b>{d['title']}</b>")
-        parts.append(f"for {d['device']} is now available!")
-        parts.append(f"By {d['maintainer']}\n")
-        # Links
-        links: List[str] = []
-        if d["screenshots"]:
-            links.append(f"▫️ Screenshots: <a href=\"{d['screenshots'][0]}\">Here</a>")
-        if d["changelog"]:
-            links.append(f"▫️ Changelog: <a href=\"{d['changelog']}\">Here</a>")
-        if d["device_changelog"]:
-            links.append(f"▫️ Device Changelog: <a href=\"{d['device_changelog']}\">Here</a>")
-        if d["download_links"]:
-            dl = " | ".join(
-                f"<a href=\"{url}\">{variant}</a>" for variant, url in d["download_links"].items()
-            )
-            links.append(f"▫️ Download: {dl}")
-        if d["readme"]:
-            links.append(f"▫️ Read: <a href=\"{d['readme']}\">Here</a>")
-        # support
-        links.append("▫️ Support: <a href=\"https://t.me/POCOHUB_X3ChatEN\">Here</a>")
-        if d["donate"]:
-            links.append(f"▫️ Donate: <a href=\"{d['donate']}\">Here</a>")
-        parts.extend(links)
-        parts.append("")
-        # Notes
-        if d["notes"]:
-            parts.append("📝 Notes:")
-            for line in d["notes"].split("\n"):
-                parts.append(f"- {line}")
-            parts.append("")
-        # Footer
-        parts.extend([
-            "Follow: @POCOHUB_X3EN",
-            "Join: @POCOHUB_X3ChatEN",
-            "Gcam: @SuryaKarna_GcamDiscussion",
-            "TG Mirror: @suryarom",
-            f"Updated - {d['build_date']}"
-        ])
-        return "\n".join(parts)
+    # remove bg using rembg
+    try:
+        img_bytes = img.tobytes()
+    except Exception:
+        # fallback to saving and using remove() on bytes
+        pass
 
-# ─── Handlers ───────────────────────────────────────────────────────────────────
-async def start(update: Update, ctx: CallbackContext) -> int:
-    # Reset any existing flow
-    PostDataManager.initialize(ctx)
-    member = await ctx.bot.get_chat_member(CHANNEL_ID, update.effective_user.id)
-    if member.status not in ("creator", "administrator"):
-        await update.message.reply_text("❌ You must be a channel admin.")
-        return ConversationHandler.END
+    # rembg expects bytes; we'll use remove on raw bytes of file
+    with input_path.open("rb") as fh:
+        input_bytes = fh.read()
+    output_bytes = remove(input_bytes)  # returns bytes (PNG)
+    from io import BytesIO
+    img = Image.open(BytesIO(output_bytes)).convert("RGBA")
+
+    # Resize with aspect preserved and pad to square 512x512
+    img.thumbnail((size, size), Image.LANCZOS)
+    # create transparent square
+    square = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    # center
+    x = (size - img.width) // 2
+    y = (size - img.height) // 2
+    square.paste(img, (x, y), img)
+    # save as webp with lossless and alpha
+    square.save(output_path, format="WEBP", lossless=True, method=6)
+
+# ─── Sticker Flow Handlers ─────────────────
+async def start_sticker_flow(update: Update, ctx: CallbackContext) -> int:
+    """Begin sticker creation flow."""
+    ctx.user_data["sticker_data"] = {"title": None, "short_name": None, "stickers": []}
     await update.message.reply_text(
-        "🤖 *ROM Post Bot* by *Shiva Karthik*\nGitHub: https://github.com/madashivakarthikgoud\n\n📸 Send banner image or /skip to omit:",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+        "🎨 *Create sticker pack*\n\n"
+        "Send a title for the sticker pack (example: `Cool Cats`) — pack will be created under this bot's name.",
+        parse_mode="Markdown"
     )
-    return BANNER
+    return STICKER_TITLE
 
-async def cancel_command(update: Update, ctx: CallbackContext) -> int:
-    # Cancel via command
-    ctx.user_data.clear()
+async def handle_sticker_title(update: Update, ctx: CallbackContext) -> int:
+    title = update.message.text.strip()
+    bot_username = (await ctx.bot.get_me()).username
+    short_name = safe_short_name(title, bot_username)
+
+    # store
+    ctx.user_data["sticker_data"]["title"] = title
+    ctx.user_data["sticker_data"]["short_name"] = short_name
+
     await update.message.reply_text(
-        "❌ Operation cancelled.",
-        reply_markup=ReplyKeyboardRemove()
+        f"✅ Title saved: *{title}*\n\n"
+        "Now send images (PNG/JPEG/WEBP) and I will auto-remove background and prepare stickers.\n"
+        "You can also send animated `.tgs` or `.webm` (video stickers).\n\n"
+        "Send multiple images. When finished, send /done",
+        parse_mode="Markdown"
     )
-    return ConversationHandler.END
+    return STICKER_IMAGES
 
-async def handle_banner(update: Update, ctx: CallbackContext) -> int:
-    if update.message.photo:
-        ctx.user_data["post_data"]["banner"] = update.message.photo[-1].file_id
-    await update.message.reply_text("📝 Enter hashtags (#tag1 #tag2) or /skip:")
-    return TAGS
+async def handle_sticker_file(update: Update, ctx: CallbackContext) -> int:
+    """
+    Accepts: photo, document (png/webp/jpeg), tgs, webm
+    For raster images: downloads, runs rembg -> convert to 512 webp.
+    For tgs/webm: downloads as-is and uses those files directly.
+    """
+    msg = update.message
+    d = ctx.user_data["sticker_data"]
+    tmpdir = Path(tempfile.mkdtemp(prefix="sticker_"))
+    ctx.user_data.setdefault("_tmpdirs", []).append(str(tmpdir))
 
-async def handle_tags(update: Update, ctx: CallbackContext) -> int:
-    txt = update.message.text.strip()
-    if txt.lower() != "/skip":
-        ctx.user_data["post_data"]["tags"] = txt.split()
-    await update.message.reply_text("🔤 Enter ROM Title:")
-    return TITLE
+    # determine file_id and mime
+    file_id = None
+    mime = None
+    filename = None
 
-async def handle_title(update: Update, ctx: CallbackContext) -> int:
-    ctx.user_data["post_data"]["title"] = update.message.text.strip()
-    await update.message.reply_text("📱 Enter Device Name:")
-    return DEVICE
-
-async def handle_device(update: Update, ctx: CallbackContext) -> int:
-    ctx.user_data["post_data"]["device"] = update.message.text.strip()
-    await update.message.reply_text("👤 Enter Maintainer (@username):")
-    return MAINTAINER
-
-async def handle_maintainer(update: Update, ctx: CallbackContext) -> int:
-    ctx.user_data["post_data"]["maintainer"] = update.message.text.strip()
-    await update.message.reply_text(
-        "📸 Send screenshot (photo) or URL; URL advances to changelog."
-    )
-    return SCREENSHOTS
-
-async def handle_screenshots(update: Update, ctx: CallbackContext) -> int:
-    d = ctx.user_data["post_data"]
-    if update.message.photo:
-        fid = update.message.photo[-1].file_id
-        link = await PostDataManager.post_photo_discussion(ctx, "Screenshots", fid)
-        d["screenshots"].append(link)
-        await update.message.reply_text("✅ Screenshot saved! More or /done")
-        return SCREENSHOTS
-    txt = update.message.text.strip()
-    if txt.lower() == "/done":
-        if not d["screenshots"]:
-            await update.message.reply_text("⚠️ Add at least one screenshot.")
-            return SCREENSHOTS
-        await update.message.reply_text("📝 Enter changelog text, URL, or /skip:")
-        return CHANGELOG
-    if URL_REGEX.match(txt):
-        d["screenshots"].append(txt)
-        await update.message.reply_text("✅ URL saved! Now changelog or /skip")
-        return CHANGELOG
-    await update.message.reply_text("❌ Send photo, valid URL, or /done.")
-    return SCREENSHOTS
-
-async def handle_changelog(update: Update, ctx: CallbackContext) -> int:
-    txt = update.message.text.strip()
-    if txt.lower() != "/skip":
-        if URL_REGEX.match(txt):
-            ctx.user_data["post_data"]["changelog"] = txt
-        else:
-            link = await PostDataManager.post_text_discussion(ctx, "Changelog", txt)
-            ctx.user_data["post_data"]["changelog"] = link
-    await update.message.reply_text("📝 Enter device changelog text, URL, or /skip:")
-    return DEVICE_CHANGELOG
-
-async def handle_device_changelog(update: Update, ctx: CallbackContext) -> int:
-    txt = update.message.text.strip()
-    if txt.lower() != "/skip":
-        if URL_REGEX.match(txt):
-            ctx.user_data["post_data"]["device_changelog"] = txt
-        else:
-            link = await PostDataManager.post_text_discussion(ctx, "Device Changelog", txt)
-            ctx.user_data["post_data"]["device_changelog"] = link
-    await update.message.reply_text("🔗 Enter download links (Variant|URL). /done when finished:")
-    return DOWNLOAD_LINKS
-
-async def handle_download_links(update: Update, ctx: CallbackContext) -> int:
-    d = ctx.user_data["post_data"]
-    txt = update.message.text.strip()
-    if txt.lower() == "/done":
-        if not d["download_links"]:
-            await update.message.reply_text("⚠️ At least one download link required.")
-            return DOWNLOAD_LINKS
-        await update.message.reply_text("💰 Enter donation link or /skip:")
-        return DONATE_LINK
-    if "|" in txt:
-        var, url = map(str.strip, txt.split("|", 1))
-        if URL_REGEX.match(url):
-            d["download_links"][var] = url
-            await update.message.reply_text(f"✅ {var} saved. More or /done?")
-            return DOWNLOAD_LINKS
-    await update.message.reply_text("❌ Format Variant|URL or /done.")
-    return DOWNLOAD_LINKS
-
-async def handle_donate(update: Update, ctx: CallbackContext) -> int:
-    txt = update.message.text.strip()
-    if txt.lower() != "/skip" and URL_REGEX.match(txt):
-        ctx.user_data["post_data"]["donate"] = txt
-    await update.message.reply_text("📖 Enter readme text, URL, or /skip:")
-    return README
-
-async def handle_readme(update: Update, ctx: CallbackContext) -> int:
-    txt = update.message.text.strip()
-    if txt.lower() != "/skip":
-        if URL_REGEX.match(txt):
-            ctx.user_data["post_data"]["readme"] = txt
-        else:
-            link = await PostDataManager.post_text_discussion(ctx, "Readme", txt)
-            ctx.user_data["post_data"]["readme"] = link
-    await update.message.reply_text("📝 Any notes? Send lines or /skip:")
-    return NOTES
-
-async def handle_notes(update: Update, ctx: CallbackContext) -> int:
-    txt = update.message.text.strip()
-    if txt.lower() != "/skip":
-        ctx.user_data["post_data"]["notes"] = txt
-    caption = PostDataManager.build_caption(ctx)
-    await update.message.reply_text(
-        caption,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Publish", callback_data="publish"),
-            InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
-        ]]),
-        disable_web_page_preview=True,
-    )
-    return CONFIRM
-
-async def publish_post(update: Update, ctx: CallbackContext) -> int:
-    query = update.callback_query
-    await query.answer()
-    d = ctx.user_data["post_data"]
-    caption = PostDataManager.build_caption(ctx)
-    send_args = dict(chat_id=CHANNEL_ID, caption=caption, parse_mode="HTML")
-    if d["banner"]:
-        await ctx.bot.send_photo(photo=d["banner"], **send_args)
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        mime = "image/jpeg"
+        filename = f"{uuid.uuid4().hex}.jpg"
+    elif msg.document:
+        file_id = msg.document.file_id
+        mime = msg.document.mime_type
+        filename = msg.document.file_name or f"{uuid.uuid4().hex}"
     else:
-        await ctx.bot.send_message(text=caption, **send_args)
-    await query.edit_message_text("✅ Successfully published!")
-    ctx.user_data.clear()
+        await msg.reply_text("❌ Send a photo or a document file (png/webp/jpg/tgs/webm).")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return STICKER_IMAGES
+
+    dest_path = tmpdir / filename
+    try:
+        await download_file(ctx.bot, file_id, dest_path)
+    except Exception as e:
+        logger.exception("download failed")
+        await msg.reply_text(f"❌ Failed to download file: {e}")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return STICKER_IMAGES
+
+    # handle types
+    lower = filename.lower()
+    try:
+        if mime == "application/x-tgsticker" or lower.endswith(".tgs"):
+            # animated sticker file (Lottie) - use directly
+            d["stickers"].append({"type": "tgs", "path": str(dest_path)})
+            await msg.reply_text("✅ Animated sticker (.tgs) accepted.")
+            return STICKER_IMAGES
+
+        if mime == "video/webm" or lower.endswith(".webm"):
+            # video sticker (WEBM) - use directly
+            d["stickers"].append({"type": "webm", "path": str(dest_path)})
+            await msg.reply_text("✅ Video sticker (.webm) accepted.")
+            return STICKER_IMAGES
+
+        # else treat as raster image -> convert + bg removal
+        # Accept png/jpg/webp
+        # Convert to png first if needed
+        input_ext = dest_path.suffix.lower()
+        raster_input = dest_path
+        # run rembg+convert
+        output_webp = tmpdir / f"{uuid.uuid4().hex}.webp"
+        try:
+            convert_raster_to_webp(raster_input, output_webp, size=512)
+        except Exception as e:
+            logger.exception("convert failed")
+            await msg.reply_text(f"❌ Image processing failed: {e}")
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return STICKER_IMAGES
+
+        d["stickers"].append({"type": "static", "path": str(output_webp)})
+        await msg.reply_text("✅ Image processed and added as sticker.")
+        return STICKER_IMAGES
+
+    except Exception as e:
+        logger.exception("handle file")
+        await msg.reply_text(f"❌ Unexpected error: {e}")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return STICKER_IMAGES
+
+async def finish_sticker_pack(update: Update, ctx: CallbackContext) -> int:
+    d = ctx.user_data.get("sticker_data", {})
+    if not d or not d.get("stickers"):
+        await update.message.reply_text("⚠️ You didn't add any stickers.")
+        return ConversationHandler.END
+
+    bot = ctx.bot
+    bot_user = await bot.get_me()
+    short_name = d["short_name"]
+    title = d["title"]
+
+    tmpdirs: List[str] = ctx.user_data.get("_tmpdirs", [])
+
+    try:
+        # create the set using the bot identity
+        first = d["stickers"][0]
+
+        if first["type"] == "static":
+            # for create_new_sticker_set, we need to provide a file-like or InputFile path
+            await bot.create_new_sticker_set(
+                user_id=bot_user.id,
+                name=short_name,
+                title=title,
+                stickers=[
+                    {"sticker": InputFile(first["path"]), "emoji_list": ["😀"]}
+                ],
+                sticker_format="static",
+            )
+        elif first["type"] == "tgs":
+            await bot.create_new_sticker_set(
+                user_id=bot_user.id,
+                name=short_name,
+                title=title,
+                stickers=[
+                    {"sticker": InputFile(first["path"]), "emoji_list": ["😀"]}
+                ],
+                sticker_format="animated",
+            )
+        elif first["type"] == "webm":
+            await bot.create_new_sticker_set(
+                user_id=bot_user.id,
+                name=short_name,
+                title=title,
+                stickers=[
+                    {"sticker": InputFile(first["path"]), "emoji_list": ["😀"]}
+                ],
+                sticker_format="video",
+            )
+        else:
+            raise RuntimeError("Unknown sticker type for first sticker")
+
+        # add the rest
+        for s in d["stickers"][1:]:
+            if s["type"] == "static":
+                await bot.add_sticker_to_set(
+                    user_id=bot_user.id,
+                    name=short_name,
+                    sticker=InputFile(s["path"]),
+                    emojis="😀"
+                )
+            elif s["type"] == "tgs":
+                await bot.add_sticker_to_set(
+                    user_id=bot_user.id,
+                    name=short_name,
+                    sticker=InputFile(s["path"]),
+                    emojis="😀"
+                )
+            elif s["type"] == "webm":
+                await bot.add_sticker_to_set(
+                    user_id=bot_user.id,
+                    name=short_name,
+                    sticker=InputFile(s["path"]),
+                    emojis="😀"
+                )
+
+        await update.message.reply_text(f"🎉 Sticker pack created!\n👉 https://t.me/addstickers/{short_name}")
+
+    except Exception as e:
+        logger.exception("create pack failed")
+        await update.message.reply_text(f"❌ Failed to create sticker pack:\n{e}")
+
+    finally:
+        # cleanup tempdirs
+        for td in tmpdirs:
+            shutil.rmtree(td, ignore_errors=True)
+        ctx.user_data.pop("_tmpdirs", None)
+        ctx.user_data.pop("sticker_data", None)
+
     return ConversationHandler.END
 
-async def cancel_post(update: Update, ctx: CallbackContext) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("❌ Operation cancelled.")
-    ctx.user_data.clear()
+async def cancel_stickers(update: Update, ctx: CallbackContext) -> int:
+    # cleanup
+    tmpdirs = ctx.user_data.get("_tmpdirs", [])
+    for td in tmpdirs:
+        shutil.rmtree(td, ignore_errors=True)
+    ctx.user_data.pop("_tmpdirs", None)
+    ctx.user_data.pop("sticker_data", None)
+    await update.message.reply_text("❌ Sticker creation cancelled.")
     return ConversationHandler.END
 
-async def help_command(update: Update, ctx: CallbackContext) -> None:
-    msg = (
-        "📚 <b>Bot Help</b>\n\n"
-        "/start – begin new ROM post\n"
-        "/cancel – cancel at any time\n\n"
-        "Flow:\n"
-        "1. Banner → 2. Tags → 3. Title → 4. Device → 5. Maintainer\n"
-        "6. Screenshots → 7. Changelog → 8. Device Changelog\n"
-        "9. Download Links → 10. Donate → 11. Readme → 12. Notes\n"
-        "Then Preview → Publish"
+async def help_command(update: Update, ctx: CallbackContext):
+    await update.message.reply_text(
+        "🤖 *Sticker Maker (Anonymous)*\n\n"
+        "• /stickers — start creating a new sticker pack (bot will own pack)\n"
+        "• Upload PNG/JPEG/WEBP for automatic bg removal\n"
+        "• Upload .tgs or .webm for animated/video stickers\n"
+        "• /done — finish and publish pack\n"
+        "• /cancel — cancel and clean up",
+        parse_mode="Markdown"
     )
-    await update.message.reply_text(msg, parse_mode="HTML")
 
-# ─── Main ───────────────────────────────────────────────────────────────────────
-def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-
-    # Load environment
-    BOT_TOKEN        = os.environ["BOT_TOKEN"]
-    CHANNEL_ID       = int(os.environ["CHANNEL_ID"])
-    DISCUSSION_ID    = int(os.environ["DISCUSSION_ID"])
-    WEBHOOK_URL_BASE = os.environ["WEBHOOK_URL_BASE"].rstrip("/")  # e.g. https://<your-app>.onrender.com
-    PORT             = int(os.environ.get("PORT", "8443"))
-
-    # Build the bot application
-    app = Application.builder().token(BOT_TOKEN).job_queue(JobQueue()).build()
-
-    # Register handlers
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+def add_sticker_handlers(app: Application):
+    sticker_conv = ConversationHandler(
+        entry_points=[CommandHandler("stickers", start_sticker_flow)],
         states={
-            BANNER:       [MessageHandler(filters.PHOTO | filters.Command("skip"), handle_banner)],
-            TAGS:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tags), CommandHandler("skip", handle_tags)],
-            TITLE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_title)],
-            DEVICE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device)],
-            MAINTAINER:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_maintainer)],
-            SCREENSHOTS:  [
-                MessageHandler(filters.PHOTO, handle_screenshots),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_screenshots),
-                CommandHandler("done", handle_screenshots),
-            ],
-            CHANGELOG:        [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_changelog), CommandHandler("skip", handle_changelog)],
-            DEVICE_CHANGELOG: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_changelog), CommandHandler("skip", handle_device_changelog)],
-            DOWNLOAD_LINKS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_download_links), CommandHandler("done", handle_download_links)],
-            DONATE_LINK:      [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_donate), CommandHandler("skip", handle_donate)],
-            README:           [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_readme), CommandHandler("skip", handle_readme)],
-            NOTES:            [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_notes), CommandHandler("skip", handle_notes)],
-            CONFIRM:          [
-                CallbackQueryHandler(publish_post, pattern="^publish$"),
-                CallbackQueryHandler(cancel_post, pattern="^cancel$"),
+            STICKER_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sticker_title)],
+            STICKER_IMAGES: [
+                MessageHandler(filters.PHOTO | filters.Document.ALL, handle_sticker_file),
+                CommandHandler("done", finish_sticker_pack)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
+        fallbacks=[CommandHandler("cancel", cancel_stickers)],
         per_user=True,
-        per_chat=True,
-        conversation_timeout=1800,
+        per_chat=True
     )
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(sticker_conv)
     app.add_handler(CommandHandler("help", help_command))
 
-    # Start webhook instead of long polling
+# ─── Main ─────────────────────────────────────
+def main() -> None:
+    BOT_TOKEN = os.environ.get("BOT_TOKEN")
+    WEBHOOK_URL_BASE = os.environ.get("WEBHOOK_URL_BASE", "").rstrip("/")
+    PORT = int(os.environ.get("PORT", "8443"))
+
+    if not BOT_TOKEN or not WEBHOOK_URL_BASE:
+        logger.error("BOT_TOKEN and WEBHOOK_URL_BASE must be set in environment")
+        raise SystemExit("Missing env vars")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    add_sticker_handlers(app)
+
+    logger.info("Starting webhook...")
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=BOT_TOKEN,
-        webhook_url=f"{WEBHOOK_URL_BASE}/{BOT_TOKEN}",
+        webhook_url=f"{WEBHOOK_URL_BASE}/{BOT_TOKEN}"
     )
 
 if __name__ == "__main__":
     main()
-
