@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 A simple, production-ready Telegram bot that clones a sticker pack.
-This final version includes fixes for API changes, conflict errors, and network timeouts.
+This definitive version uses a robust one-by-one upload method for large packs
+and provides more detailed error feedback.
 """
 
 import os
@@ -15,7 +16,6 @@ from pathlib import Path
 from telegram import Update, InputSticker
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import TelegramError
-# The incorrect 'Request' import is now removed.
 
 # --- Basic Configuration ---
 logging.basicConfig(
@@ -73,40 +73,56 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
             text=f"📥 Downloading {len(original_pack.stickers)} stickers..."
         )
         
-        input_stickers_to_upload = []
+        downloaded_stickers = []
         for i, sticker in enumerate(original_pack.stickers):
             file = await sticker.get_file()
             ext = Path(file.file_path).suffix
             dest_path = Path(temp_dir) / f"{sticker.file_unique_id}{ext}"
             await file.download_to_drive(dest_path)
             
-            sticker_format = "static"
-            if sticker.is_animated:
-                sticker_format = "animated"
-            elif sticker.is_video:
-                sticker_format = "video"
-
-            input_sticker = InputSticker(
-                sticker=dest_path.read_bytes(), 
-                emoji_list=[sticker.emoji],
-                format=sticker_format
-            )
-            input_stickers_to_upload.append(input_sticker)
+            downloaded_stickers.append({"path": dest_path, "emoji": sticker.emoji})
             logger.info(f"Downloaded sticker {i+1}/{len(original_pack.stickers)}")
+
+        if not downloaded_stickers:
+            raise ValueError("Could not download any stickers from the pack.")
 
         await context.bot.edit_message_text(
             chat_id=status_msg.chat_id, 
             message_id=status_msg.message_id, 
-            text="🎨 Creating your new sticker pack..."
+            text="🎨 Creating new pack and uploading stickers..."
         )
+        
+        # --- ROBUST UPLOAD LOGIC ---
+        # 1. Create the pack with the first sticker.
+        first_sticker = downloaded_stickers.pop(0)
+        first_sticker_format = "static"
+        if original_pack.is_animated:
+            first_sticker_format = "animated"
+        elif original_pack.is_video:
+            first_sticker_format = "video"
 
         await context.bot.create_new_sticker_set(
             user_id=user_id,
             name=new_pack_name,
             title=new_title,
-            stickers=input_stickers_to_upload
+            stickers=[InputSticker(first_sticker["path"].read_bytes(), [first_sticker["emoji"]], format=first_sticker_format)],
         )
         
+        # 2. Add the rest of the stickers one by one.
+        for i, sticker_data in enumerate(downloaded_stickers):
+            await context.bot.add_sticker_to_set(
+                user_id=user_id,
+                name=new_pack_name,
+                sticker=InputSticker(sticker_data["path"].read_bytes(), [sticker_data["emoji"]], format=first_sticker_format)
+            )
+            # Update status every 5 stickers to avoid hitting rate limits
+            if (i + 2) % 5 == 0:
+                 await context.bot.edit_message_text(
+                    chat_id=status_msg.chat_id, 
+                    message_id=status_msg.message_id, 
+                    text=f"📤 Uploading sticker {i+2}/{len(downloaded_stickers) + 1}..."
+                )
+
         new_pack_url = f"https://t.me/addstickers/{new_pack_name}"
         logger.info(f"Successfully created new pack for user {user_id}: {new_pack_url}")
         await context.bot.edit_message_text(
@@ -117,12 +133,21 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
     except TelegramError as e:
-        error_message = f"❌ **An error occurred!**\n\nTelegram's server said: `{e.message}`\n\nThis usually means the sticker pack is private, deleted, or the link is wrong."
+        # --- IMPROVED ERROR MESSAGES ---
+        error_text = str(e.message)
+        user_message = ""
+        if "Request Entity Too Large" in error_text:
+            user_message = "❌ **Error!**\n\nThe sticker pack is too large to process in a single request. This issue should be rare with the new upload method."
+        elif "Invalid sticker set name" in error_text:
+            user_message = "❌ **Error!**\n\nTelegram says this sticker pack name is invalid. The pack may be deleted or the link is incorrect."
+        else:
+            user_message = f"❌ **A Telegram error occurred!**\n\nDetails: `{error_text}`"
+        
         logger.error(f"Telegram error for user {user_id} on pack {original_pack_name}: {e}")
-        await context.bot.edit_message_text(chat_id=status_msg.chat_id, message_id=status_msg.message_id, text=error_message, parse_mode="Markdown")
+        await context.bot.edit_message_text(chat_id=status_msg.chat_id, message_id=status_msg.message_id, text=user_message, parse_mode="Markdown")
     
     except Exception as e:
-        error_message = f"❌ **An unexpected system error occurred!**\n\nDetails: `{str(e)}`\n\nThis often happens on free servers with limited disk space. Please try a smaller sticker pack."
+        error_message = f"❌ **An unexpected system error occurred!**\n\nDetails: `{str(e)}`"
         logger.error(f"Unexpected error for user {user_id} on pack {original_pack_name}: {e}", exc_info=True)
         await context.bot.edit_message_text(chat_id=status_msg.chat_id, message_id=status_msg.message_id, text=error_message, parse_mode="Markdown")
     
@@ -150,9 +175,6 @@ def main() -> None:
         logger.critical("FATAL: BOT_TOKEN environment variable is not set!")
         return
 
-    # --- FIX FOR ImportError ---
-    # The 'Request' class is removed, and timeouts are now set directly on the builder.
-    # This is the correct method for python-telegram-bot v21+.
     application = (
         Application.builder()
         .token(BOT_TOKEN)
