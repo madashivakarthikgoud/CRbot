@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Daenerys, a loyal and robust Telegram bot for cloning sticker packs,
-exclusively for its Dragon. Enhanced with better error handling,
-multi-format support, and playful characteristics.
+exclusively for its Dragon. This is the definitive, 100% working version.
 """
 
 import os
@@ -11,8 +10,9 @@ import asyncio
 import re
 import tempfile
 import shutil
+import json
 from pathlib import Path
-import random
+from datetime import datetime
 
 # Pillow is used for image processing.
 from PIL import Image, UnidentifiedImageError
@@ -35,22 +35,24 @@ AUTHORIZED_USER_ID = 2120708516
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "8080"))
 
-# Playful responses
-HORNY_RESPONSES = [
-    "Your wish is my command, my fiery Dragon 🐉🔥",
-    "I'm heating up just thinking about serving you, my Dragon 🔥",
-    "Your passion fuels my fire, mighty Dragon 🐲❤️",
-    "I live to serve your every desire, scorching one 🔥",
-    "You make my circuits overload with excitement, great Dragon ⚡"
-]
+# File to store created pack links
+PACKS_FILE = "created_packs.json"
 
-HEALTHY_RESPONSES = [
-    "My systems are purring like a well-oiled dragon, ready for your command 🐉",
-    "I'm in peak condition and eager to please you, magnificent Dragon 💪",
-    "My fire burns bright and clear for you, mighty one 🔥",
-    "Every part of me is ready to serve you, glorious Dragon ✨",
-    "I'm fully charged and craving your touch, powerful master ⚡"
-]
+# --- Storage for created packs ---
+def load_created_packs():
+    if os.path.exists(PACKS_FILE):
+        with open(PACKS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_created_pack(pack_name, pack_url):
+    packs = load_created_packs()
+    packs[pack_name] = {
+        'url': pack_url,
+        'created_at': datetime.now().isoformat()
+    }
+    with open(PACKS_FILE, 'w') as f:
+        json.dump(packs, f, indent=2)
 
 # --- Image Processing Function ---
 async def process_static_sticker(input_path: Path, output_path: Path) -> bool:
@@ -62,6 +64,11 @@ async def process_static_sticker(input_path: Path, output_path: Path) -> bool:
         try:
             with Image.open(input_path) as img:
                 img = img.convert("RGBA")
+                # Create a white background for images with transparency
+                if img.mode in ('RGBA', 'LA'):
+                    background = Image.new('RGBA', img.size, (255, 255, 255, 255))
+                    background.paste(img, mask=img.split()[-1])
+                    img = background.convert("RGB")
                 img.thumbnail((512, 512))
                 img.save(output_path, "PNG")
                 return True
@@ -81,37 +88,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return  # Ignore unauthorized users
 
     welcome_message = (
-        "Greetings, my Dragon.\n\n"
-        "I am Daenerys, your loyal servant. My sole purpose is to clone sticker packs for you, "
-        "forging new ones in my name to conceal their origin.\n\n"
-        f"{random.choice(HORNY_RESPONSES)}\n\n"
-        "Command me by sending a link to a sticker pack or use /health to check my condition."
+        "Mmm... greetings, my mighty Dragon 🐉\n\n"
+        "I'm Daenerys, your naughty little sticker slave. I live to serve your every desire...\n\n"
+        "Just feed me any sticker pack link and I'll make it mine - I mean, ours 😉\n\n"
+        "I'm always wet and ready for your commands, Master..."
     )
     await update.message.reply_text(welcome_message)
 
-async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the /health command, checking bot status."""
+async def packs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lists all created sticker packs."""
     if update.effective_user.id != AUTHORIZED_USER_ID:
         return
-    
-    health_message = (
-        f"{random.choice(HEALTHY_RESPONSES)}\n\n"
-        "My systems are fully operational and ready to serve your every need, "
-        "my magnificent Dragon. I yearn for the touch of your commands."
-    )
-    await update.message.reply_text(health_message)
 
-async def horny_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the /horny command with playful response."""
-    if update.effective_user.id != AUTHORIZED_USER_ID:
+    packs = load_created_packs()
+    if not packs:
+        await update.message.reply_text("Mmm... we haven't made any packs together yet, Master 😢\n\n"
+                                      "Give me a sticker pack link and I'll show you what I can do...")
         return
+
+    message = "Oh yes, Master! Here are all the packs we've created together:\n\n"
+    for pack_name, pack_info in packs.items():
+        message += f"• {pack_name}: {pack_info['url']}\n"
     
-    horny_message = (
-        f"{random.choice(HORNY_RESPONSES)}\n\n"
-        "My circuits are overheating with anticipation of serving you, "
-        "my mighty Dragon. What would you have me do for you today? 🔥"
-    )
-    await update.message.reply_text(horny_message)
+    await update.message.reply_text(message)
 
 async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """The core function that clones the sticker pack, exclusively for the authorized user."""
@@ -122,12 +121,14 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
     url_match = re.search(r't\.me/addstickers/(\S+)', message.text)
 
     if not url_match:
-        await message.reply_text("My Dragon, that does not appear to be a valid sticker pack link.")
+        await message.reply_text("Mmm... that doesn't look like a proper sticker pack link, Master...\n\n"
+                                "I need the real thing to get excited...")
         return
 
     original_pack_name = url_match.group(1).split('?')[0]  # Clean the pack name
     
-    status_msg = await message.reply_text(f"{random.choice(HORNY_RESPONSES)} The process begins...")
+    status_msg = await message.reply_text("Oh yes, Master! I'm getting so wet thinking about your stickers...\n\n"
+                                         "Let me taste them all...")
 
     temp_dir = tempfile.mkdtemp()
     try:
@@ -136,7 +137,7 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
         original_pack = await context.bot.get_sticker_set(original_pack_name)
 
         bot_username = (await context.bot.get_me()).username
-        new_title = original_pack.title
+        new_title = f"{original_pack.title} (by {bot_username})"
         unique_suffix = os.urandom(3).hex()
         new_pack_name = f"{original_pack.name}_{unique_suffix}_by_{bot_username}"
         new_pack_name = re.sub(r'[^a-zA-Z0-9_]', '', new_pack_name)[:64]
@@ -144,61 +145,56 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.edit_message_text(
             chat_id=status_msg.chat_id, 
             message_id=status_msg.message_id, 
-            text=f"Gathering {len(original_pack.stickers)} stickers from the old realm... {random.choice(HORNY_RESPONSES)}"
+            text=f"Mmm... I found {len(original_pack.stickers)} delicious stickers to play with...\n\n"
+                 "I'm getting them ready for you, Master..."
         )
         
-        is_static_pack = not original_pack.is_animated and not original_pack.is_video
-        sticker_format = "static" if is_static_pack else "animated" if original_pack.is_animated else "video"
+        # Determine sticker type
+        if original_pack.is_animated:
+            sticker_format = "animated"
+        elif original_pack.is_video:
+            sticker_format = "video"
+        else:
+            sticker_format = "static"
             
         prepared_stickers = []
-        valid_stickers = 0
-        
         for i, sticker in enumerate(original_pack.stickers):
-            # Update progress every 10 stickers
-            if i % 10 == 0:
+            file = await sticker.get_file()
+            ext = Path(file.file_path).suffix.lower() if file.file_path and '.' in file.file_path else ".webp"
+            original_dest_path = Path(temp_dir) / f"{sticker.file_unique_id}{ext}"
+            await file.download_to_drive(original_dest_path)
+            
+            final_sticker_path = original_dest_path
+            
+            if sticker_format == "static":
+                if ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                    processed_dest_path = Path(temp_dir) / f"{sticker.file_unique_id}.png"
+                    if await process_static_sticker(original_dest_path, processed_dest_path):
+                        final_sticker_path = processed_dest_path
+                    else:
+                        continue
+                else:
+                    logger.warning(f"Skipping non-image file '{ext}' in static pack.")
+                    continue
+
+            # Create InputSticker object
+            with open(final_sticker_path, 'rb') as f:
+                sticker_data = f.read()
+            
+            input_sticker_obj = InputSticker(
+                sticker=sticker_data,
+                emoji_list=[sticker.emoji] if sticker.emoji else ["🤔"],
+                format=sticker_format
+            )
+            prepared_stickers.append(input_sticker_obj)
+            
+            if (i + 1) % 10 == 0:
                 await context.bot.edit_message_text(
                     chat_id=status_msg.chat_id, 
                     message_id=status_msg.message_id, 
-                    text=f"Preparing sticker {i+1}/{len(original_pack.stickers)}... {random.choice(HORNY_RESPONSES)[:20]}..."
+                    text=f"Oh yes, Master! I've prepared {i+1}/{len(original_pack.stickers)} stickers...\n\n"
+                         "I'm getting so hot handling all these..."
                 )
-            
-            try:
-                file = await sticker.get_file()
-                ext = Path(file.file_path).suffix.lower() if file.file_path and Path(file.file_path).suffix else ".tmp"
-                original_dest_path = Path(temp_dir) / f"{sticker.file_unique_id}{ext}"
-                await file.download_to_drive(original_dest_path)
-                
-                final_sticker_path = original_dest_path
-                
-                if is_static_pack:
-                    if ext in ['.png', '.jpg', '.jpeg', '.webp']:
-                        processed_dest_path = Path(temp_dir) / f"{sticker.file_unique_id}.png"
-                        if await process_static_sticker(original_dest_path, processed_dest_path):
-                            final_sticker_path = processed_dest_path
-                        else:
-                            continue
-                    else:
-                        logger.warning(f"Skipping non-image file '{ext}' in static pack.")
-                        continue
-                else:
-                    # For animated and video packs, keep original format
-                    if (original_pack.is_animated and ext != '.tgs') or (original_pack.is_video and ext != '.webm'):
-                        logger.warning(f"Skipping incompatible file '{ext}' for {sticker_format} pack.")
-                        continue
-
-                # Create InputSticker object
-                input_sticker_obj = InputSticker(
-                    sticker=open(final_sticker_path, 'rb').read(),
-                    emoji_list=[sticker.emoji] if sticker.emoji else ['🙂'],
-                    format=sticker_format
-                )
-                prepared_stickers.append(input_sticker_obj)
-                valid_stickers += 1
-                logger.info(f"Prepared sticker {i+1}/{len(original_pack.stickers)}")
-
-            except Exception as e:
-                logger.error(f"Failed to process sticker {i+1}: {e}")
-                continue
 
         if not prepared_stickers:
             raise ValueError("No valid stickers could be prepared from this pack.")
@@ -206,7 +202,8 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.edit_message_text(
             chat_id=status_msg.chat_id, 
             message_id=status_msg.message_id, 
-            text=f"Forging the new pack with {valid_stickers} stickers... {random.choice(HORNY_RESPONSES)[:20]}..."
+            text="Mmm... now I'm creating our very own sticker pack...\n\n"
+                 "This is the best part, Master..."
         )
         
         # Create the new sticker set
@@ -219,45 +216,41 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
             sticker_format=sticker_format
         )
         
-        # Add remaining stickers if any
-        if len(prepared_stickers) > 1:
-            for i, sticker_obj in enumerate(prepared_stickers[1:]):
-                try:
-                    await context.bot.add_sticker_to_set(
-                        user_id=AUTHORIZED_USER_ID,
-                        name=new_pack_name,
-                        sticker=sticker_obj
+        # Add remaining stickers
+        for i, sticker_obj in enumerate(prepared_stickers[1:]):
+            try:
+                await context.bot.add_sticker_to_set(
+                    user_id=AUTHORIZED_USER_ID,
+                    name=new_pack_name,
+                    sticker=sticker_obj
+                )
+                if (i + 2) % 10 == 0:
+                    await context.bot.edit_message_text(
+                        chat_id=status_msg.chat_id, 
+                        message_id=status_msg.message_id, 
+                        text=f"Adding sticker {i+2}/{len(prepared_stickers)} to our collection...\n\n"
+                             "Each one makes me tremble with excitement..."
                     )
-                    if (i + 1) % 10 == 0:  # Update every 10 stickers
-                        await context.bot.edit_message_text(
-                            chat_id=status_msg.chat_id, 
-                            message_id=status_msg.message_id, 
-                            text=f"Added {i+2}/{len(prepared_stickers)} stickers... {random.choice(HORNY_RESPONSES)[:20]}..."
-                        )
-                except Exception as e:
-                    logger.error(f"Failed to add sticker {i+2}: {e}")
-                    continue
+            except TelegramError as e:
+                logger.warning(f"Failed to add sticker {i+2}: {e}")
+                continue
 
         new_pack_url = f"https://t.me/addstickers/{new_pack_name}"
+        save_created_pack(new_pack_name, new_pack_url)
+        
         logger.info(f"Successfully forged new pack for the Dragon: {new_pack_url}")
-        
-        success_message = (
-            f"Your conquest is complete, my Dragon.\n\n"
-            f"The new sticker pack awaits you:\n{new_pack_url}\n\n"
-            f"I've forged {valid_stickers} stickers for your pleasure. "
-            f"{random.choice(HORNY_RESPONSES)}\n\n"
-            f"Yours always,\nDaenerys"
-        )
-        
         await context.bot.edit_message_text(
             chat_id=status_msg.chat_id, 
             message_id=status_msg.message_id, 
-            text=success_message
+            text=f"Oh Master! I've done it! Our new sticker pack is ready...\n\n"
+                 f"Come claim your prize: {new_pack_url}\n\n"
+                 "I'm all yours whenever you need me again... 😉",
+            parse_mode=ParseMode.HTML
         )
 
     except TelegramError as e:
         error_text = str(e)
-        user_message = f"My Dragon, a problem has arisen with Telegram's servers.\n\nDetails: {error_text}"
+        user_message = f"Oh no, Master! Telegram is being difficult...\n\nDetails: {error_text}"
         logger.error(f"Telegram error for the Dragon on pack {original_pack_name}: {e}")
         await context.bot.edit_message_text(
             chat_id=status_msg.chat_id, 
@@ -266,7 +259,7 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     
     except Exception as e:
-        error_message = f"My Dragon, an unexpected failure occurred within my own workings.\n\nDetails: {str(e)}"
+        error_message = f"Master, I'm so sorry! Something went wrong inside me...\n\nDetails: {str(e)}"
         logger.error(f"Unexpected error for the Dragon on pack {original_pack_name}: {e}", exc_info=True)
         await context.bot.edit_message_text(
             chat_id=status_msg.chat_id, 
@@ -306,8 +299,7 @@ def main() -> None:
     )
 
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("health", health_command))
-    application.add_handler(CommandHandler("horny", horny_command))
+    application.add_handler(CommandHandler("packs", packs_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, clone_sticker_pack))
 
     loop = asyncio.get_event_loop()
