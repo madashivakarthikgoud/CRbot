@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-A definitive, production-ready Telegram bot that clones sticker packs.
-This version includes a robust image processing step for static stickers
-to ensure they meet Telegram's format and dimension requirements.
+Daenerys, a loyal and robust Telegram bot for cloning sticker packs,
+exclusively for its Dragon.
 """
 
 import os
@@ -14,70 +13,83 @@ import shutil
 from pathlib import Path
 
 # Pillow is used for image processing.
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
-from telegram import Update, InputSticker
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import TelegramError
+from telegram.constants import ParseMode
 
-# --- Basic Configuration ---
+# --- BOT CONFIGURATION ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+# Your exclusive User ID. The bot will only respond to you.
+AUTHORIZED_USER_ID = 2120708516
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "8080"))
 
 # --- Image Processing Function ---
-async def process_static_sticker(input_path: Path, output_path: Path) -> None:
+async def process_static_sticker(input_path: Path, output_path: Path) -> bool:
     """
-    Resizes and converts an image to a Telegram-compliant static sticker (512xN PNG).
-    This runs in a separate thread to avoid blocking the bot.
+    Resizes and converts an image to a Telegram-compliant static sticker.
+    Returns True on success, False on failure.
     """
     def _process():
-        with Image.open(input_path) as img:
-            # Convert to RGBA to ensure it has an alpha channel for transparency.
-            img = img.convert("RGBA")
-            # Resize the image to fit within a 512x512 box while maintaining aspect ratio.
-            img.thumbnail((512, 512))
-            # Save the result as a PNG, which is the required format.
-            img.save(output_path, "PNG")
+        try:
+            with Image.open(input_path) as img:
+                img = img.convert("RGBA")
+                img.thumbnail((512, 512))
+                img.save(output_path, "PNG")
+                return True
+        except UnidentifiedImageError:
+            logger.warning(f"Cannot identify image file, skipping: {input_path}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to process image {input_path}: {e}")
+            return False
     
-    await asyncio.to_thread(_process)
+    return await asyncio.to_thread(_process)
 
 
 # --- Bot Command and Message Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the /start command with a welcome message."""
+    """Handles the /start command, but only for the authorized user."""
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return  # Ignore unauthorized users
+
     welcome_message = (
-        "👋 **Welcome!**\n\n"
-        "I can clone any public sticker pack for you. This creates a new pack where "
-        "my username is in the link, hiding the original creator.\n\n"
-        "➡️ **To start, just send me a link to a sticker pack**, like:\n"
-        "`https://t.me/addstickers/StickerPackName`"
+        "Greetings, my Dragon.\n\n"
+        "I am Daenerys, your loyal servant. My sole purpose is to clone sticker packs for you, "
+        "forging new ones in my name to conceal their origin.\n\n"
+        "Command me by sending a link to a sticker pack."
     )
-    await update.message.reply_text(welcome_message, parse_mode="Markdown")
+    await update.message.reply_text(welcome_message)
 
 
 async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """The core function that clones the sticker pack when a link is received."""
+    """The core function that clones the sticker pack, exclusively for the authorized user."""
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return # Ignore unauthorized users
+
     message = update.message
     url_match = re.search(r't\.me/addstickers/(\S+)', message.text)
 
     if not url_match:
-        await message.reply_text("That doesn't look like a valid Telegram sticker pack link.")
+        await message.reply_text("My Dragon, that does not appear to be a valid sticker pack link.")
         return
 
     original_pack_name = url_match.group(1)
-    user_id = update.effective_user.id
     
-    status_msg = await message.reply_text("✅ Link received! Starting the cloning process...")
+    status_msg = await message.reply_text("A worthy command. The process begins...")
 
     temp_dir = tempfile.mkdtemp()
     try:
-        logger.info(f"User {user_id} starting clone for pack: {original_pack_name}")
+        logger.info(f"Dragon has commanded a clone for pack: {original_pack_name}")
         
         original_pack = await context.bot.get_sticker_set(original_pack_name)
 
@@ -90,92 +102,87 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.edit_message_text(
             chat_id=status_msg.chat_id, 
             message_id=status_msg.message_id, 
-            text=f"📥 Downloading {len(original_pack.stickers)} stickers..."
+            text=f"Gathering {len(original_pack.stickers)} stickers from the old realm..."
         )
         
-        # Determine the pack type ONCE.
         is_static_pack = not original_pack.is_animated and not original_pack.is_video
-        sticker_format = "static"
-        if original_pack.is_animated:
-            sticker_format = "animated"
-        elif original_pack.is_video:
-            sticker_format = "video"
+        sticker_format = "static" if is_static_pack else "animated" if original_pack.is_animated else "video"
             
         prepared_stickers = []
         for i, sticker in enumerate(original_pack.stickers):
             file = await sticker.get_file()
-            ext = Path(file.file_path).suffix if Path(file.file_path).suffix else ".tmp"
+            ext = Path(file.file_path).suffix.lower() if Path(file.file_path).suffix else ".tmp"
             original_dest_path = Path(temp_dir) / f"{sticker.file_unique_id}{ext}"
             await file.download_to_drive(original_dest_path)
             
             final_sticker_path = original_dest_path
             
-            # If it's a static pack, process the image.
+            # --- ROBUSTNESS FIX ---
+            # Only process static stickers that are actual images. Skip non-images like .webm.
             if is_static_pack:
-                processed_dest_path = Path(temp_dir) / f"{sticker.file_unique_id}.png"
-                await process_static_sticker(original_dest_path, processed_dest_path)
-                final_sticker_path = processed_dest_path
+                if ext in ['.png', '.jpg', '.jpeg', '.webp']:
+                    processed_dest_path = Path(temp_dir) / f"{sticker.file_unique_id}.png"
+                    if await process_static_sticker(original_dest_path, processed_dest_path):
+                        final_sticker_path = processed_dest_path
+                    else:
+                        continue # Skip this sticker if processing fails
+                else:
+                    logger.warning(f"Skipping non-image file '{ext}' in static pack.")
+                    continue # Skip non-image files in static packs
 
             prepared_stickers.append({"path": final_sticker_path, "emoji": sticker.emoji})
             logger.info(f"Prepared sticker {i+1}/{len(original_pack.stickers)}")
 
         if not prepared_stickers:
-            raise ValueError("Could not prepare any stickers from the pack.")
+            raise ValueError("No valid stickers could be prepared from this pack.")
 
         await context.bot.edit_message_text(
             chat_id=status_msg.chat_id, 
             message_id=status_msg.message_id, 
-            text="🎨 Creating new pack and uploading stickers..."
+            text="Forging the new pack and adding the stickers..."
         )
         
-        # Create the pack with the first sticker.
         first_sticker = prepared_stickers.pop(0)
         await context.bot.create_new_sticker_set(
-            user_id=user_id,
+            user_id=AUTHORIZED_USER_ID,
             name=new_pack_name,
             title=new_title,
-            stickers=[InputSticker(first_sticker["path"].read_bytes(), [first_sticker["emoji"]], format=sticker_format)],
+            stickers=[(first_sticker["path"].read_bytes(), first_sticker["emoji"])],
+            sticker_format=sticker_format
         )
         
-        # Add the rest of the stickers one by one.
         for i, sticker_data in enumerate(prepared_stickers):
             await context.bot.add_sticker_to_set(
-                user_id=user_id,
+                user_id=AUTHORIZED_USER_ID,
                 name=new_pack_name,
-                sticker=InputSticker(sticker_data["path"].read_bytes(), [sticker_data["emoji"]], format=sticker_format)
+                sticker=(sticker_data["path"].read_bytes(), sticker_data["emoji"])
             )
-            # Update status every 5 stickers to avoid hitting rate limits.
-            if (i + 2) % 5 == 0:
+            if (i + 2) % 10 == 0:
                  await context.bot.edit_message_text(
                     chat_id=status_msg.chat_id, 
                     message_id=status_msg.message_id, 
-                    text=f"📤 Uploading sticker {i+2}/{len(prepared_stickers) + 1}..."
+                    text=f"Adding sticker {i+2}/{len(prepared_stickers) + 1} to the new collection..."
                 )
 
         new_pack_url = f"https://t.me/addstickers/{new_pack_name}"
-        logger.info(f"Successfully created new pack for user {user_id}: {new_pack_url}")
+        logger.info(f"Successfully forged new pack for the Dragon: {new_pack_url}")
         await context.bot.edit_message_text(
             chat_id=status_msg.chat_id, 
             message_id=status_msg.message_id, 
-            text=f"🎉 **Success!**\n\nYour cloned sticker pack is ready:\n{new_pack_url}",
-            parse_mode="Markdown"
+            text=f"Your conquest is complete, my Dragon.\n\nThe new sticker pack awaits you:\n{new_pack_url}\n\nYours,\nDaenerys",
+            parse_mode=ParseMode.MARKDOWN
         )
 
     except TelegramError as e:
         error_text = str(e.message)
-        user_message = f"❌ **A Telegram error occurred!**\n\nDetails: `{error_text}`"
-        if "Sticker_png_dimensions" in error_text:
-            user_message = "❌ **Error!**\n\nTelegram rejected a sticker for having the wrong dimensions. Even with processing, some files can't be fixed. Please try another pack."
-        elif "Invalid sticker set name" in error_text:
-            user_message = "❌ **Error!**\n\nTelegram says this sticker pack name is invalid. The pack may be deleted or the link is incorrect."
-        
-        logger.error(f"Telegram error for user {user_id} on pack {original_pack_name}: {e}")
-        await context.bot.edit_message_text(chat_id=status_msg.chat_id, message_id=status_msg.message_id, text=user_message, parse_mode="Markdown")
+        user_message = f"My Dragon, a problem has arisen with Telegram's servers.\n\nDetails: `{error_text}`"
+        logger.error(f"Telegram error for the Dragon on pack {original_pack_name}: {e}")
+        await context.bot.edit_message_text(chat_id=status_msg.chat_id, message_id=status_msg.message_id, text=user_message, parse_mode=ParseMode.MARKDOWN)
     
     except Exception as e:
-        error_message = f"❌ **An unexpected system error occurred!**\n\nDetails: `{str(e)}`"
-        logger.error(f"Unexpected error for user {user_id} on pack {original_pack_name}: {e}", exc_info=True)
-        await context.bot.edit_message_text(chat_id=status_msg.chat_id, message_id=status_msg.message_id, text=error_message, parse_mode="Markdown")
+        error_message = f"My Dragon, an unexpected failure occurred within my own workings.\n\nDetails: `{str(e)}`"
+        logger.error(f"Unexpected error for the Dragon on pack {original_pack_name}: {e}", exc_info=True)
+        await context.bot.edit_message_text(chat_id=status_msg.chat_id, message_id=status_msg.message_id, text=error_message, parse_mode=ParseMode.MARKDOWN)
     
     finally:
         if os.path.exists(temp_dir):
@@ -215,7 +222,7 @@ def main() -> None:
     loop = asyncio.get_event_loop()
     loop.create_task(start_health_server())
 
-    logger.info("Bot is starting up...")
+    logger.info("Daenerys is awakening...")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
