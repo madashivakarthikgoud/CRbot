@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Sticker Maker (NO background removal) with background job queue.
+Production-ready sticker maker (polling) with background job queue.
 
-- Accepts PNG/JPEG/WEBP (raster) and .tgs/.webm (animated/video)
-- Converts raster images to 512x512 WEBP (preserve aspect, center on transparent canvas)
-- /stickers -> start flow
-- Upload files -> /done to enqueue processing (immediate "Queued" response)
-- Background workers process files and create sticker packs under the bot account
-- Small HTTP health server so Render detects an open port (if $PORT provided)
+Notes:
+- Set BOT_TOKEN in env.
+- If you deploy as a Render Web Service, set PORT so the included tiny
+  health HTTP server binds to it (Render will detect an open port).
+- REMBG_ENABLED (default "false") toggles background removal. If false,
+  the bot converts/resizes and pads images only (no rembg dependency).
 """
 
 import os
@@ -20,9 +20,9 @@ import time
 import asyncio
 import signal
 import concurrent.futures
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from io import BytesIO
 
 from telegram import Update, InputFile
 from telegram.error import TelegramError
@@ -37,74 +37,75 @@ from telegram.ext import (
 
 from PIL import Image
 
-# -----------------------
-# Logging / configuration
-# -----------------------
+# Optional rembg import (only if REMBG_ENABLED=true)
+REMBG_ENABLED = os.getenv("REMBG_ENABLED", "").lower() in ("1", "true", "yes")
+if REMBG_ENABLED:
+    try:
+        from rembg import remove  # type: ignore
+    except Exception as e:
+        raise RuntimeError("REMBG_ENABLED is true but rembg import failed: " + str(e))
+
+# tiny health server so Render web services detect open port
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK\n")
+    def log_message(self, format, *args):
+        return
+
+def start_health_http_server(port: int):
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    except Exception as e:
+        logger.warning("Could not start health server on port %s: %s", port, e)
+        return None
+    thread = threading.Thread(target=server.serve_forever, name="health-server", daemon=True)
+    thread.start()
+    logger.info("Health server listening on 0.0.0.0:%d", port)
+    return server
+
+# ---------------------
+# configuration & logging
+# ---------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("sticker-bot-no-rembg")
+logger = logging.getLogger("sticker-bot-no-rembg" if not REMBG_ENABLED else "sticker-bot")
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    logger.error("BOT_TOKEN is required in environment")
+    logger.error("BOT_TOKEN environment variable is required")
     raise SystemExit("BOT_TOKEN missing")
 
-# Tunables (env)
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))           # threadpool size for CPU work
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))     # concurrent processing semaphore
-MAX_IMAGE_MB = float(os.environ.get("MAX_IMAGE_MB", "12"))      # max upload size per file (MB)
-MAX_FILES_PER_JOB = int(os.environ.get("MAX_FILES_PER_JOB", "25"))
-RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", "0.3"))
-TEMP_ROOT = os.environ.get("TEMP_ROOT", "")                     # optional base tmp dir
-ADMIN_USER_IDS = set(int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip())
+# Tunables
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))           # threadpool workers for CPU tasks
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))     # concurrent processing semaphore
+MAX_IMAGE_MB = float(os.getenv("MAX_IMAGE_MB", "12"))      # per-file size limit (MB)
+MAX_FILES_PER_JOB = int(os.getenv("MAX_FILES_PER_JOB", "25"))
+RATE_LIMIT_SECONDS = float(os.getenv("RATE_LIMIT_SECONDS", "0.3"))
+TEMP_ROOT = os.getenv("TEMP_ROOT", "")
+ADMIN_USER_IDS = set(int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip())
 
-# Conversation states
+# conversation states
 ST_TITLE, ST_IMAGES = range(2)
 
-# Executor/semaphore/queue
+# executor + semaphore + queue
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
 sem = asyncio.Semaphore(MAX_CONCURRENT)
 TASK_QUEUE: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
 JOB_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 ALLOWED_RASTER_EXT = (".png", ".jpg", ".jpeg", ".webp")
+ALLOWED_ANIM_EXT = (".tgs", ".webm")
 USER_LAST_ACTION: Dict[int, float] = {}
 
-# -----------------------
-# Health HTTP server
-# -----------------------
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK\n")
-    def log_message(self, format, *args):
-        return
-
-def start_health_http_server(port: int) -> Optional[ThreadingHTTPServer]:
-    try:
-        server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
-        server.allow_reuse_address = True
-    except Exception as e:
-        logger.exception("Failed to bind health server to port %s: %s", port, e)
-        return None
-
-    def _serve():
-        try:
-            logger.info("Health server listening on 0.0.0.0:%d", port)
-            server.serve_forever()
-        except Exception:
-            logger.exception("Health server stopped with exception")
-
-    import threading
-    th = threading.Thread(target=_serve, name="health-server", daemon=True)
-    th.start()
-    return server
-
-# -----------------------
-# Utilities
-# -----------------------
+# ---------------------
+# helpers
+# ---------------------
 def now_ts() -> float:
     return time.time()
 
@@ -131,32 +132,35 @@ def sanitize_short_name(title: str, bot_username: str) -> str:
     return name[:64]
 
 async def download_file(bot, file_id: str, dest_path: Path) -> Path:
-    f = await bot.get_file(file_id)
-    if getattr(f, "file_size", None):
-        size_mb = f.file_size / (1024 * 1024)
+    tf = await bot.get_file(file_id)
+    if getattr(tf, "file_size", None):
+        size_mb = tf.file_size / (1024 * 1024)
         if size_mb > MAX_IMAGE_MB:
             raise ValueError(f"File too large: {size_mb:.2f} MB (limit {MAX_IMAGE_MB} MB)")
-    await f.download_to_drive(custom_path=str(dest_path))
+    await tf.download_to_drive(custom_path=str(dest_path))
     return dest_path
 
-# New: simple raster conversion (NO background removal)
-def raster_convert_sync(input_path: Path, output_path: Path, size: int = 512) -> None:
-    """
-    Convert raster image to 512x512 WEBP:
-    - Open with Pillow
-    - Convert to RGBA
-    - Resize preserving aspect (thumbnail), center on transparent canvas
-    - Save as lossless WEBP with alpha
-    """
-    img = Image.open(input_path).convert("RGBA")
-    img.thumbnail((size, size), Image.LANCZOS)
-    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    canvas.paste(img, ((size - img.width) // 2, (size - img.height) // 2), img)
-    canvas.save(output_path, format="WEBP", lossless=True, method=6)
+# raster processing: *if* rembg enabled, remove background; otherwise just resize & pad
+def raster_process_sync(input_path: Path, output_path: Path, size: int = 512) -> None:
+    with input_path.open("rb") as fh:
+        input_bytes = fh.read()
 
-async def raster_convert_async(input_path: Path, output_path: Path, size: int = 512):
+    if REMBG_ENABLED:
+        # background removal using rembg (may be heavy)
+        out_bytes = remove(input_bytes)
+        img = Image.open(BytesIO(out_bytes)).convert("RGBA")
+    else:
+        # simple convert: open and convert; preserve alpha if any
+        img = Image.open(BytesIO(input_bytes)).convert("RGBA")
+
+    img.thumbnail((size, size), Image.LANCZOS)
+    square = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    square.paste(img, ((size - img.width) // 2, (size - img.height) // 2), img)
+    square.save(output_path, format="WEBP", lossless=True, method=6)
+
+async def raster_process_async(input_path: Path, output_path: Path, size: int = 512):
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(executor, raster_convert_sync, input_path, output_path, size)
+    await loop.run_in_executor(executor, raster_process_sync, input_path, output_path, size)
 
 async def create_sticker_set_with_retries(bot, bot_user_id: int, base_name: str, title: str, first_path: str, first_type: str, max_tries: int = 6) -> str:
     attempt = 0
@@ -184,7 +188,7 @@ async def create_sticker_set_with_retries(bot, bot_user_id: int, base_name: str,
             last_exc = e
             st = str(e).lower()
             logger.warning("create_new_sticker_set attempt %d failed: %s", attempt, e)
-            if "already exists" in st or "name is already occupied" in st:
+            if "already exists" in st or "name is already occupied" in st or "is already occupied" in st:
                 suffix = uuid.uuid4().hex[:4]
                 base_cut = base_name[:48]
                 name = f"{base_cut}_{suffix}_by_{bot_user_id}"[:64]
@@ -195,17 +199,18 @@ async def create_sticker_set_with_retries(bot, bot_user_id: int, base_name: str,
                 raise
     raise last_exc or RuntimeError("Failed to create sticker set after retries")
 
-# -----------------------
+# ---------------------
 # Conversation handlers
-# -----------------------
+# ---------------------
 async def cmd_help(update: Update, ctx: CallbackContext):
     await update.message.reply_text(
-        "🤖 *Sticker Maker (Queued, no bg removal)*\n\n"
-        "/stickers — start a new sticker pack\n"
-        "/done — finish and queue processing\n"
-        "/cancel — cancel flow & cleanup\n"
+        "🤖 *Sticker Maker (Queued)*\n\n"
+        "/stickers — start new sticker pack\n"
+        "/done — finish & queue processing\n"
+        "/cancel — cancel & cleanup\n"
         "/health — check bot\n\n"
-        "Upload PNG/JPEG/WEBP for conversion, or .tgs/.webm for animated/video.",
+        "Upload PNG/JPEG/WEBP for conversion; if REMBG_ENABLED=true background removal will run.\n"
+        "Upload .tgs/.webm for animated/video stickers.\n",
         parse_mode="Markdown"
     )
 
@@ -219,7 +224,7 @@ async def start_stickers(update: Update, ctx: CallbackContext) -> int:
         await update.message.reply_text("⏳ Slow down (rate limit).")
         return ConversationHandler.END
     ctx.user_data["sticker_data"] = {"title": None, "short_name": None, "raw_files": [], "tmpdirs": []}
-    await update.message.reply_text("🎨 Send the sticker pack title (e.g., `Cool Cats`).")
+    await update.message.reply_text("🎨 Send sticker pack title (e.g., `Cool Cats`).")
     return ST_TITLE
 
 async def handle_title(update: Update, ctx: CallbackContext) -> int:
@@ -263,7 +268,7 @@ async def handle_files(update: Update, ctx: CallbackContext) -> int:
             file_id = doc.file_id
             filename = doc.file_name or f"{uuid.uuid4().hex}"
         else:
-            await msg.reply_text("❌ Send a photo or a supported file (.png/.jpg/.webp/.tgs/.webm).")
+            await msg.reply_text("❌ Send a photo or supported file (.png/.jpg/.webp/.tgs/.webm).")
             return ST_IMAGES
 
         dest = tmpdir / filename
@@ -272,7 +277,7 @@ async def handle_files(update: Update, ctx: CallbackContext) -> int:
 
         size_mb = dest.stat().st_size / (1024 * 1024)
         if size_mb > MAX_IMAGE_MB:
-            await msg.reply_text(f"❌ File too large ({size_mb:.2f} MB). Limit {MAX_IMAGE_MB} MB.")
+            await msg.reply_text(f"❌ File too large ({size_mb:.2f}MB). Limit {MAX_IMAGE_MB}MB.")
             shutil.rmtree(tmpdir, ignore_errors=True)
             ctx.user_data["sticker_data"]["tmpdirs"].remove(str(tmpdir))
             return ST_IMAGES
@@ -284,12 +289,9 @@ async def handle_files(update: Update, ctx: CallbackContext) -> int:
         elif lower.endswith(".webm"):
             d["raw_files"].append({"type": "webm", "path": str(dest)})
             await msg.reply_text("✅ Video .webm queued.")
-        elif lower.endswith(ALLOWED_RASTER_EXT):
-            d["raw_files"].append({"type": "raster", "path": str(dest)})
-            await msg.reply_text("✅ Image queued for conversion (no bg removal).")
         else:
             d["raw_files"].append({"type": "raster", "path": str(dest)})
-            await msg.reply_text("✅ File queued (treated as image).")
+            await msg.reply_text("✅ Image queued for conversion.")
         return ST_IMAGES
 
     except ValueError as ve:
@@ -339,7 +341,6 @@ async def cmd_done_queue(update: Update, ctx: CallbackContext) -> int:
         "status": "queued",
         "enqueued_at": now_ts(),
     }
-
     JOB_REGISTRY[job_id] = job
     await TASK_QUEUE.put(job)
     logger.info("Enqueued job %s for user %s (%d files)", job_id, user.username or user_id, len(raw_files))
@@ -356,9 +357,19 @@ async def cmd_cancel(update: Update, ctx: CallbackContext) -> int:
     await update.message.reply_text("❌ Cancelled & cleaned up.")
     return ConversationHandler.END
 
-# -----------------------
-# Worker loop
-# -----------------------
+async def cmd_queue_status(update: Update, ctx: CallbackContext):
+    uid = update.effective_user.id
+    if ADMIN_USER_IDS and uid not in ADMIN_USER_IDS:
+        await update.message.reply_text("Unauthorized")
+        return
+    qsize = TASK_QUEUE.qsize()
+    jobs = [f"{jid}:{meta.get('status','?')}" for jid, meta in JOB_REGISTRY.items()]
+    msg = f"queue={qsize}\njobs={len(JOB_REGISTRY)}\n" + ("\n".join(jobs[:50]) if jobs else "none")
+    await update.message.reply_text(f"```\n{msg}\n```", parse_mode="Markdown")
+
+# ---------------------
+# worker loop
+# ---------------------
 async def worker_loop(app: Application, worker_id: int):
     bot = app.bot
     logger.info("Worker %d started", worker_id)
@@ -374,6 +385,7 @@ async def worker_loop(app: Application, worker_id: int):
             raw_files = job.get("raw_files", [])
             tmpdirs = job.get("tmpdirs", [])
 
+            # notify
             try:
                 await bot.edit_message_text(chat_id=chat_id, message_id=reply_message_id,
                                             text=f"🔁 Job `{job_id}` started — processing {len(raw_files)} file(s)...", parse_mode="Markdown")
@@ -390,11 +402,11 @@ async def worker_loop(app: Application, worker_id: int):
                     async with sem:
                         try:
                             outp = Path(path).with_suffix(".webp")
-                            await raster_convert_async(Path(path), outp, size=512)
+                            await raster_process_async(Path(path), outp, size=512)
                             processed.append({"type": "static", "path": str(outp)})
                         except Exception as e:
-                            logger.exception("Raster conversion failed for %s", path)
-                            await bot.send_message(chat_id=chat_id, text=f"⚠️ Failed to convert {Path(path).name}: {e}")
+                            logger.exception("Raster processing failed for %s", path)
+                            await bot.send_message(chat_id=chat_id, text=f"⚠️ Failed to process {Path(path).name}: {e}")
                 elif ftype == "tgs":
                     processed.append({"type": "tgs", "path": str(path)})
                 elif ftype == "webm":
@@ -406,6 +418,7 @@ async def worker_loop(app: Application, worker_id: int):
                 await bot.edit_message_text(chat_id=chat_id, message_id=reply_message_id,
                                            text=f"❌ Job `{job_id}` failed — no valid stickers processed.")
                 JOB_REGISTRY[job_id]["status"] = "failed"
+                TASK_QUEUE.task_done()
                 continue
 
             bot_user = await bot.get_me()
@@ -417,6 +430,7 @@ async def worker_loop(app: Application, worker_id: int):
                                        text=f"🚀 Job `{job_id}` — creating sticker pack...")
             created_name = await create_sticker_set_with_retries(bot, bot_user.id, short_name, title, first_path, first_type, max_tries=8)
 
+            # add remaining stickers
             for idx, s in enumerate(processed[1:], start=2):
                 try:
                     await bot.add_sticker_to_set(user_id=bot_user.id, name=created_name, sticker=InputFile(s["path"]), emojis="😀")
@@ -446,22 +460,9 @@ async def worker_loop(app: Application, worker_id: int):
                     logger.exception("Failed to cleanup %s", td)
             TASK_QUEUE.task_done()
 
-# -----------------------
-# Admin: queue status
-# -----------------------
-async def cmd_queue_status(update: Update, ctx: CallbackContext):
-    uid = update.effective_user.id
-    if ADMIN_USER_IDS and uid not in ADMIN_USER_IDS:
-        await update.message.reply_text("Unauthorized")
-        return
-    qsize = TASK_QUEUE.qsize()
-    jobs = [f"{jid}:{meta.get('status','?')}" for jid, meta in JOB_REGISTRY.items()]
-    msg = f"queue={qsize}\njobs={len(JOB_REGISTRY)}\n" + ("\n".join(jobs[:50]) if jobs else "none")
-    await update.message.reply_text(f"```{msg}```", parse_mode="Markdown")
-
-# -----------------------
-# Graceful shutdown
-# -----------------------
+# ---------------------
+# boot & graceful shutdown
+# ---------------------
 def _install_sigterm_handler(loop: asyncio.AbstractEventLoop):
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -470,18 +471,23 @@ def _install_sigterm_handler(loop: asyncio.AbstractEventLoop):
             pass
 
 async def _shutdown(loop: asyncio.AbstractEventLoop, sig):
-    logger.info("Received exit signal %s. Shutting down...", sig)
-    await asyncio.sleep(0.1)
+    logger.info("Received signal %s. Shutting down...", sig)
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     for t in tasks:
         t.cancel()
     await asyncio.sleep(0.1)
     loop.stop()
 
-# -----------------------
-# Main
-# -----------------------
 def main():
+    # start tiny health server if PORT is provided so Render sees an open port
+    port_env = os.getenv("PORT")
+    if port_env:
+        try:
+            port_int = int(port_env)
+            start_health_http_server(port_int)
+        except Exception as e:
+            logger.warning("Health server startup failed: %s", e)
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -490,11 +496,11 @@ def main():
             ST_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_title)],
             ST_IMAGES: [
                 MessageHandler(filters.PHOTO | filters.Document.ALL, handle_files),
-                CommandHandler("done", cmd_done_queue),
+                CommandHandler("done", cmd_done_queue)
             ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        per_user=True, per_chat=True,
+        per_user=True, per_chat=True
     )
 
     app.add_handler(conv)
@@ -502,36 +508,31 @@ def main():
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("qstatus", cmd_queue_status))
 
-    async def runner():
+    # post-init: spawn worker tasks (will run in same event loop)
+    async def _post_init(app_obj: Application):
         loop = asyncio.get_running_loop()
         _install_sigterm_handler(loop)
         worker_tasks = []
         for wid in range(max(1, MAX_WORKERS)):
-            worker_tasks.append(loop.create_task(worker_loop(app, wid + 1)))
+            t = loop.create_task(worker_loop(app_obj, wid + 1))
+            worker_tasks.append(t)
+        # store so shutdown handler can cancel them
+        app_obj.bot_data["worker_tasks"] = worker_tasks
         logger.info("Spawned %d worker(s) (MAX_CONCURRENT=%d)", len(worker_tasks), MAX_CONCURRENT)
-        await app.run_polling(stop_signals=None)
-        for t in worker_tasks:
-            t.cancel()
-        await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-    port_env = os.environ.get("PORT") or os.environ.get("RENDER_INTERNAL_PORT")
-    if port_env:
-        try:
-            port_int = int(port_env)
-            server = start_health_http_server(port_int)
-            if server is None:
-                logger.warning("Health server failed to start on port %s", port_env)
-        except Exception as e:
-            logger.exception("Health server startup error: %s", e)
-    else:
-        logger.info("No PORT env detected — recommended to run as Render Background Worker for polling bots")
+    # post-shutdown: cancel workers
+    async def _post_shutdown(app_obj: Application):
+        tasks = app_obj.bot_data.get("worker_tasks", [])
+        for t in tasks:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("Worker tasks cancelled")
 
-    try:
-        asyncio.run(runner())
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received, exiting")
-    finally:
-        logger.info("Bot stopped")
+    # run polling and let PTB call post_init -> spawn workers correctly
+    app.run_polling(post_init=_post_init, post_shutdown=_post_shutdown)
 
 if __name__ == "__main__":
     main()
