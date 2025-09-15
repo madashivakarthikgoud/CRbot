@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-A simple, production-ready Telegram bot that clones a sticker pack.
-This definitive version uses a robust one-by-one upload method for large packs
-and provides more detailed error feedback.
+A definitive, production-ready Telegram bot that clones sticker packs.
+This version includes a robust image processing step for static stickers
+to ensure they meet Telegram's format and dimension requirements.
 """
 
 import os
@@ -12,6 +12,9 @@ import re
 import tempfile
 import shutil
 from pathlib import Path
+
+# Pillow is used for image processing.
+from PIL import Image
 
 from telegram import Update, InputSticker
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -27,8 +30,25 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "8080"))
 
-# --- Bot Command and Message Handlers ---
+# --- Image Processing Function ---
+async def process_static_sticker(input_path: Path, output_path: Path) -> None:
+    """
+    Resizes and converts an image to a Telegram-compliant static sticker (512xN PNG).
+    This runs in a separate thread to avoid blocking the bot.
+    """
+    def _process():
+        with Image.open(input_path) as img:
+            # Convert to RGBA to ensure it has an alpha channel for transparency.
+            img = img.convert("RGBA")
+            # Resize the image to fit within a 512x512 box while maintaining aspect ratio.
+            img.thumbnail((512, 512))
+            # Save the result as a PNG, which is the required format.
+            img.save(output_path, "PNG")
+    
+    await asyncio.to_thread(_process)
 
+
+# --- Bot Command and Message Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles the /start command with a welcome message."""
     welcome_message = (
@@ -73,18 +93,34 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
             text=f"📥 Downloading {len(original_pack.stickers)} stickers..."
         )
         
-        downloaded_stickers = []
+        # Determine the pack type ONCE.
+        is_static_pack = not original_pack.is_animated and not original_pack.is_video
+        sticker_format = "static"
+        if original_pack.is_animated:
+            sticker_format = "animated"
+        elif original_pack.is_video:
+            sticker_format = "video"
+            
+        prepared_stickers = []
         for i, sticker in enumerate(original_pack.stickers):
             file = await sticker.get_file()
-            ext = Path(file.file_path).suffix
-            dest_path = Path(temp_dir) / f"{sticker.file_unique_id}{ext}"
-            await file.download_to_drive(dest_path)
+            ext = Path(file.file_path).suffix if Path(file.file_path).suffix else ".tmp"
+            original_dest_path = Path(temp_dir) / f"{sticker.file_unique_id}{ext}"
+            await file.download_to_drive(original_dest_path)
             
-            downloaded_stickers.append({"path": dest_path, "emoji": sticker.emoji})
-            logger.info(f"Downloaded sticker {i+1}/{len(original_pack.stickers)}")
+            final_sticker_path = original_dest_path
+            
+            # If it's a static pack, process the image.
+            if is_static_pack:
+                processed_dest_path = Path(temp_dir) / f"{sticker.file_unique_id}.png"
+                await process_static_sticker(original_dest_path, processed_dest_path)
+                final_sticker_path = processed_dest_path
 
-        if not downloaded_stickers:
-            raise ValueError("Could not download any stickers from the pack.")
+            prepared_stickers.append({"path": final_sticker_path, "emoji": sticker.emoji})
+            logger.info(f"Prepared sticker {i+1}/{len(original_pack.stickers)}")
+
+        if not prepared_stickers:
+            raise ValueError("Could not prepare any stickers from the pack.")
 
         await context.bot.edit_message_text(
             chat_id=status_msg.chat_id, 
@@ -92,35 +128,28 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
             text="🎨 Creating new pack and uploading stickers..."
         )
         
-        # --- ROBUST UPLOAD LOGIC ---
-        # 1. Create the pack with the first sticker.
-        first_sticker = downloaded_stickers.pop(0)
-        first_sticker_format = "static"
-        if original_pack.is_animated:
-            first_sticker_format = "animated"
-        elif original_pack.is_video:
-            first_sticker_format = "video"
-
+        # Create the pack with the first sticker.
+        first_sticker = prepared_stickers.pop(0)
         await context.bot.create_new_sticker_set(
             user_id=user_id,
             name=new_pack_name,
             title=new_title,
-            stickers=[InputSticker(first_sticker["path"].read_bytes(), [first_sticker["emoji"]], format=first_sticker_format)],
+            stickers=[InputSticker(first_sticker["path"].read_bytes(), [first_sticker["emoji"]], format=sticker_format)],
         )
         
-        # 2. Add the rest of the stickers one by one.
-        for i, sticker_data in enumerate(downloaded_stickers):
+        # Add the rest of the stickers one by one.
+        for i, sticker_data in enumerate(prepared_stickers):
             await context.bot.add_sticker_to_set(
                 user_id=user_id,
                 name=new_pack_name,
-                sticker=InputSticker(sticker_data["path"].read_bytes(), [sticker_data["emoji"]], format=first_sticker_format)
+                sticker=InputSticker(sticker_data["path"].read_bytes(), [sticker_data["emoji"]], format=sticker_format)
             )
-            # Update status every 5 stickers to avoid hitting rate limits
+            # Update status every 5 stickers to avoid hitting rate limits.
             if (i + 2) % 5 == 0:
                  await context.bot.edit_message_text(
                     chat_id=status_msg.chat_id, 
                     message_id=status_msg.message_id, 
-                    text=f"📤 Uploading sticker {i+2}/{len(downloaded_stickers) + 1}..."
+                    text=f"📤 Uploading sticker {i+2}/{len(prepared_stickers) + 1}..."
                 )
 
         new_pack_url = f"https://t.me/addstickers/{new_pack_name}"
@@ -133,15 +162,12 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
     except TelegramError as e:
-        # --- IMPROVED ERROR MESSAGES ---
         error_text = str(e.message)
-        user_message = ""
-        if "Request Entity Too Large" in error_text:
-            user_message = "❌ **Error!**\n\nThe sticker pack is too large to process in a single request. This issue should be rare with the new upload method."
+        user_message = f"❌ **A Telegram error occurred!**\n\nDetails: `{error_text}`"
+        if "Sticker_png_dimensions" in error_text:
+            user_message = "❌ **Error!**\n\nTelegram rejected a sticker for having the wrong dimensions. Even with processing, some files can't be fixed. Please try another pack."
         elif "Invalid sticker set name" in error_text:
             user_message = "❌ **Error!**\n\nTelegram says this sticker pack name is invalid. The pack may be deleted or the link is incorrect."
-        else:
-            user_message = f"❌ **A Telegram error occurred!**\n\nDetails: `{error_text}`"
         
         logger.error(f"Telegram error for user {user_id} on pack {original_pack_name}: {e}")
         await context.bot.edit_message_text(chat_id=status_msg.chat_id, message_id=status_msg.message_id, text=user_message, parse_mode="Markdown")
