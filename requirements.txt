@@ -1,15 +1,6 @@
-# Telegram API
 python-telegram-bot==20.6
-
-# Image processing
 Pillow==11.3.0
 numpy==1.26.1
-
-# Background removal (CPU-friendly rembg version)
 rembg==2.0.67
-
-# ONNX runtime (rembg depends on it; include a compatible CPU build)
 onnxruntime==1.15.1
-
-# Optional utilities
 python-dotenv==1.0.0
