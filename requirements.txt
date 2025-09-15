@@ -1,6 +1,6 @@
 python-telegram-bot==20.6
-Pillow
-rembg[gpu]==2.1.1  # or rembg==2.1.1 if you don't need GPU extras
-numpy
-uvicorn
-aiohttp
+Pillow>=11.3
+rembg==2.0.67          # Latest rembg version compatible with Python 3.11
+numpy>=1.24
+uvicorn>=0.23
+aiohttp>=3.8
