@@ -15,7 +15,7 @@ from pathlib import Path
 from telegram import Update, InputSticker
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import TelegramError
-from telegram.request import Request
+# The incorrect 'Request' import is now removed.
 
 # --- Basic Configuration ---
 logging.basicConfig(
@@ -80,8 +80,6 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
             dest_path = Path(temp_dir) / f"{sticker.file_unique_id}{ext}"
             await file.download_to_drive(dest_path)
             
-            # --- FIX FOR TypeError ---
-            # Determine the format for each sticker and pass it to InputSticker.
             sticker_format = "static"
             if sticker.is_animated:
                 sticker_format = "animated"
@@ -91,7 +89,7 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
             input_sticker = InputSticker(
                 sticker=dest_path.read_bytes(), 
                 emoji_list=[sticker.emoji],
-                format=sticker_format  # This required argument was missing
+                format=sticker_format
             )
             input_stickers_to_upload.append(input_sticker)
             logger.info(f"Downloaded sticker {i+1}/{len(original_pack.stickers)}")
@@ -102,8 +100,6 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
             text="🎨 Creating your new sticker pack..."
         )
 
-        # The API method for creating a sticker set has also changed.
-        # We now must pass a list of InputSticker objects directly.
         await context.bot.create_new_sticker_set(
             user_id=user_id,
             name=new_pack_name,
@@ -154,11 +150,16 @@ def main() -> None:
         logger.critical("FATAL: BOT_TOKEN environment variable is not set!")
         return
 
-    # --- FIX FOR Timeouts ---
-    # Increase the timeouts for connecting and reading from the API.
-    request = Request(connect_timeout=30.0, read_timeout=30.0)
-    
-    application = Application.builder().token(BOT_TOKEN).request(request).build()
+    # --- FIX FOR ImportError ---
+    # The 'Request' class is removed, and timeouts are now set directly on the builder.
+    # This is the correct method for python-telegram-bot v21+.
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, clone_sticker_pack))
@@ -167,8 +168,6 @@ def main() -> None:
     loop.create_task(start_health_server())
 
     logger.info("Bot is starting up...")
-    # --- FIX FOR Conflict ---
-    # drop_pending_updates helps the bot start clean after a crash or restart.
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
