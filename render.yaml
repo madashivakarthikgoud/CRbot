@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: sticker-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: PORT
+        value: 10000
+      - key: REMBG_ENABLED
+        value: false
+      - key: MAX_WORKERS
+        value: 2
+      - key: MAX_CONCURRENT
+        value: 2
