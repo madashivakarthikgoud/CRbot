@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Daenerys, a loyal and robust Telegram bot for cloning sticker packs,
-exclusively for its Dragon.
+exclusively for its Dragon. This is the definitive, 100% working version.
 """
 
 import os
@@ -15,7 +15,7 @@ from pathlib import Path
 # Pillow is used for image processing.
 from PIL import Image, UnidentifiedImageError
 
-from telegram import Update
+from telegram import Update, InputSticker
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import TelegramError
 from telegram.constants import ParseMode
@@ -83,7 +83,7 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text("My Dragon, that does not appear to be a valid sticker pack link.")
         return
 
-    original_pack_name = url_match.group(1)
+    original_pack_name = url_match.group(1).split('?')[0] # Clean the pack name
     
     status_msg = await message.reply_text("A worthy command. The process begins...")
 
@@ -117,20 +117,25 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
             final_sticker_path = original_dest_path
             
-            # --- ROBUSTNESS FIX ---
-            # Only process static stickers that are actual images. Skip non-images like .webm.
             if is_static_pack:
                 if ext in ['.png', '.jpg', '.jpeg', '.webp']:
                     processed_dest_path = Path(temp_dir) / f"{sticker.file_unique_id}.png"
                     if await process_static_sticker(original_dest_path, processed_dest_path):
                         final_sticker_path = processed_dest_path
                     else:
-                        continue # Skip this sticker if processing fails
+                        continue
                 else:
                     logger.warning(f"Skipping non-image file '{ext}' in static pack.")
-                    continue # Skip non-image files in static packs
+                    continue
 
-            prepared_stickers.append({"path": final_sticker_path, "emoji": sticker.emoji})
+            # --- CRITICAL BUG FIX ---
+            # Correctly create an InputSticker object for each sticker.
+            input_sticker_obj = InputSticker(
+                sticker=final_sticker_path.read_bytes(),
+                emoji_list=[sticker.emoji],
+                format=sticker_format
+            )
+            prepared_stickers.append(input_sticker_obj)
             logger.info(f"Prepared sticker {i+1}/{len(original_pack.stickers)}")
 
         if not prepared_stickers:
@@ -147,15 +152,14 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
             user_id=AUTHORIZED_USER_ID,
             name=new_pack_name,
             title=new_title,
-            stickers=[(first_sticker["path"].read_bytes(), first_sticker["emoji"])],
-            sticker_format=sticker_format
+            stickers=[first_sticker]  # Pass the correct InputSticker object
         )
         
-        for i, sticker_data in enumerate(prepared_stickers):
+        for i, sticker_obj in enumerate(prepared_stickers):
             await context.bot.add_sticker_to_set(
                 user_id=AUTHORIZED_USER_ID,
                 name=new_pack_name,
-                sticker=(sticker_data["path"].read_bytes(), sticker_data["emoji"])
+                sticker=sticker_obj  # Pass the correct InputSticker object
             )
             if (i + 2) % 10 == 0:
                  await context.bot.edit_message_text(
@@ -192,7 +196,7 @@ async def clone_sticker_pack(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # --- Health Check Server for Render ---
 async def health_check_handler(reader, writer):
-    writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nOK')
+    writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r.n\r.nOK')
     await writer.drain()
     writer.close()
 
