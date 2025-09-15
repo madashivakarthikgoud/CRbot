@@ -1,3 +1,6 @@
-python-telegram-bot[job-queue,webhooks]==20.7
-python-dotenv>=1.0.0
-aiohttp>=3.8.1
+python-telegram-bot==20.6
+Pillow
+rembg[gpu]==2.1.1  # or rembg==2.1.1 if you don't need GPU extras
+numpy
+uvicorn
+aiohttp
